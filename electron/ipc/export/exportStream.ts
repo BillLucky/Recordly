@@ -6,6 +6,7 @@ import { app } from "electron";
 
 type ExportStreamSession = {
 	streamId: string;
+	sessionDir: string;
 	tempPath: string;
 	fileHandle: fs.promises.FileHandle;
 	bytesWritten: number;
@@ -17,6 +18,30 @@ type ExportStreamSession = {
 const exportStreamSessions = new Map<string, ExportStreamSession>();
 
 const EXTENSION_ALLOWLIST = /^[a-z0-9]{1,8}$/;
+const SESSION_DIR_PREFIX = "recordly-export-";
+
+// Paths that the export pipeline itself produced (stream temp files plus any
+// successor temp files returned by main-process helpers such as
+// muxNativeVideoExportAudio). Every renderer-facing handler that moves or
+// deletes a path must assert membership here before touching disk, so a
+// compromised renderer can never route arbitrary file paths into the IPC.
+const ownedExportPaths = new Set<string>();
+
+function normalizeOwnedPath(candidate: string): string {
+	return path.resolve(candidate);
+}
+
+export function registerOwnedExportPath(candidate: string): void {
+	ownedExportPaths.add(normalizeOwnedPath(candidate));
+}
+
+export function releaseOwnedExportPath(candidate: string): void {
+	ownedExportPaths.delete(normalizeOwnedPath(candidate));
+}
+
+export function isOwnedExportPath(candidate: string): boolean {
+	return ownedExportPaths.has(normalizeOwnedPath(candidate));
+}
 
 function generateStreamId() {
 	return `recordly-export-stream-${randomUUID()}`;
@@ -31,12 +56,27 @@ export async function openExportStream(options?: { extension?: string }): Promis
 		throw new Error(`Invalid export stream extension: ${extension}`);
 	}
 	const streamId = generateStreamId();
-	const tempPath = path.join(app.getPath("temp"), `${streamId}.${extension}`);
-	await fsp.mkdir(path.dirname(tempPath), { recursive: true });
-	const fileHandle = await fsp.open(tempPath, "w+");
+
+	// Per-session 0700 directory defeats TOCTOU/symlink races on shared
+	// tempdirs (e.g. /tmp on Linux): only the current user can enter the dir,
+	// so an adversary cannot pre-plant a symlink at the file path.
+	const sessionDir = await fsp.mkdtemp(path.join(app.getPath("temp"), SESSION_DIR_PREFIX));
+	try {
+		await fsp.chmod(sessionDir, 0o700);
+	} catch {
+		// chmod is a defense-in-depth on platforms where mkdtemp already sets
+		// a safe mode. Non-Linux filesystems may ignore mode bits entirely.
+	}
+	const tempPath = path.join(sessionDir, `${streamId}.${extension}`);
+	const fileHandle = await fsp.open(
+		tempPath,
+		fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL,
+		0o600,
+	);
 
 	exportStreamSessions.set(streamId, {
 		streamId,
+		sessionDir,
 		tempPath,
 		fileHandle,
 		bytesWritten: 0,
@@ -44,6 +84,7 @@ export async function openExportStream(options?: { extension?: string }): Promis
 		writeQueue: Promise.resolve(),
 		aborted: false,
 	});
+	registerOwnedExportPath(tempPath);
 
 	return { streamId, tempPath };
 }
@@ -84,7 +125,7 @@ export async function writeToExportStream(
 export async function closeExportStream(
 	streamId: string,
 	options?: { abort?: boolean },
-): Promise<{ tempPath: string; bytesWritten: number }> {
+): Promise<{ tempPath: string | null; bytesWritten: number }> {
 	const session = exportStreamSessions.get(streamId);
 	if (!session) {
 		throw new Error(`Export stream not found: ${streamId}`);
@@ -110,11 +151,21 @@ export async function closeExportStream(
 	exportStreamSessions.delete(streamId);
 
 	if (abort) {
+		releaseOwnedExportPath(session.tempPath);
 		try {
 			await fsp.rm(session.tempPath, { force: true });
 		} catch {
 			// Temp file may be gone already.
 		}
+		try {
+			await fsp.rm(session.sessionDir, { recursive: true, force: true });
+		} catch {
+			// ignore
+		}
+		// Aborted streams return `tempPath: null` so callers cannot accidentally
+		// reuse a path that no longer references a file on disk (or, worse, a
+		// path a later session may recycle).
+		return { tempPath: null, bytesWritten: 0 };
 	}
 
 	return {
@@ -130,6 +181,7 @@ export function hasExportStream(streamId: string): boolean {
 export async function cleanupAllExportStreams(): Promise<void> {
 	const sessions = Array.from(exportStreamSessions.values());
 	exportStreamSessions.clear();
+	ownedExportPaths.clear();
 	await Promise.allSettled(
 		sessions.map(async (session) => {
 			try {
@@ -139,6 +191,11 @@ export async function cleanupAllExportStreams(): Promise<void> {
 			}
 			try {
 				await fsp.rm(session.tempPath, { force: true });
+			} catch {
+				// ignore
+			}
+			try {
+				await fsp.rm(session.sessionDir, { recursive: true, force: true });
 			} catch {
 				// ignore
 			}

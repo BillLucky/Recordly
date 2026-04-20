@@ -418,7 +418,7 @@ export class ModernVideoExporter {
 				}
 				const finishResult = await this.finishNativeVideoExport(nativeAudioPlan);
 				this.finalizationTimeMs = this.getNowMs() - stageStartedAt;
-				if (!finishResult.success || !finishResult.blob) {
+				if (!finishResult.success || (!finishResult.tempFilePath && !finishResult.blob)) {
 					return {
 						success: false,
 						error: finishResult.error || `${NATIVE_EXPORT_ENGINE_NAME} export failed`,
@@ -428,6 +428,7 @@ export class ModernVideoExporter {
 
 				return {
 					success: true,
+					tempFilePath: finishResult.tempFilePath,
 					blob: finishResult.blob,
 					metrics: finishResult.metrics ?? this.buildExportMetrics(),
 				};

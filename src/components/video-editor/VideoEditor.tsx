@@ -585,9 +585,7 @@ export default function VideoEditor() {
 	// still bake cursor/zoom animations into the output — without it, the
 	// auto-export fires as soon as the video loads and the telemetry arrives
 	// after encoding has started.
-	const [cursorTelemetrySourcePath, setCursorTelemetrySourcePath] = useState<
-		string | null
-	>(null);
+	const [cursorTelemetrySourcePath, setCursorTelemetrySourcePath] = useState<string | null>(null);
 	const [selectedZoomId, setSelectedZoomId] = useState<string | null>(null);
 	const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
 	const [selectedTrimId, setSelectedTrimId] = useState<string | null>(null);
@@ -3949,6 +3947,15 @@ export default function VideoEditor() {
 							}
 							setExportError(saveResult.message || "Failed to save video");
 							toast.error(saveResult.message || "Failed to save video");
+							// Keep the pending-save entry so the user can retry without
+							// re-rendering. The temp file is still on disk (the main
+							// process only moves/deletes it on success) and the
+							// ArrayBuffer fallback still references its in-memory blob.
+							if (pendingOnCancel.tempFilePath || pendingOnCancel.arrayBuffer) {
+								pendingExportSaveRef.current = pendingOnCancel;
+								setHasPendingExportSave(true);
+								keepExportDialogOpen = true;
+							}
 							if (smokeExportConfig.enabled) {
 								window.close();
 								return;

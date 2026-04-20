@@ -1,26 +1,26 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("electron", () => {
-	const tmpRoot = path.join(os.tmpdir(), `recordly-export-stream-test-${Date.now()}`);
-	return {
-		app: {
-			getPath: (key: string) => {
-				if (key === "temp") {
-					return tmpRoot;
-				}
-				throw new Error(`Unexpected app.getPath key: ${key}`);
-			},
+const TMP_ROOT = path.join(os.tmpdir(), `recordly-export-stream-test-${Date.now()}`);
+
+vi.mock("electron", () => ({
+	app: {
+		getPath: (key: string) => {
+			if (key === "temp") {
+				return TMP_ROOT;
+			}
+			throw new Error(`Unexpected app.getPath key: ${key}`);
 		},
-	};
-});
+	},
+}));
 
 import {
 	cleanupAllExportStreams,
 	closeExportStream,
 	hasExportStream,
+	isOwnedExportPath,
 	openExportStream,
 	writeToExportStream,
 } from "./exportStream";
@@ -31,6 +31,14 @@ async function readBytes(filePath: string): Promise<Uint8Array> {
 
 describe("exportStream", () => {
 	const openedTempPaths: string[] = [];
+
+	beforeAll(async () => {
+		await fs.mkdir(TMP_ROOT, { recursive: true });
+	});
+
+	afterAll(async () => {
+		await fs.rm(TMP_ROOT, { recursive: true, force: true });
+	});
 
 	beforeEach(() => {
 		openedTempPaths.length = 0;
@@ -78,15 +86,33 @@ describe("exportStream", () => {
 		expect(bytes[17]).toBe(0xee);
 	});
 
-	it("removes the temp file when closed with abort", async () => {
+	it("removes the temp file when closed with abort and returns a null tempPath", async () => {
 		const { streamId, tempPath } = await openExportStream();
 		openedTempPaths.push(tempPath);
 		await writeToExportStream(streamId, 0, new Uint8Array([9, 9, 9]));
 
-		await closeExportStream(streamId, { abort: true });
+		const result = await closeExportStream(streamId, { abort: true });
 
 		await expect(fs.access(tempPath)).rejects.toThrow();
 		expect(hasExportStream(streamId)).toBe(false);
+		expect(result.tempPath).toBeNull();
+		expect(result.bytesWritten).toBe(0);
+		expect(isOwnedExportPath(tempPath)).toBe(false);
+	});
+
+	it("tracks open temp paths in the owned-path registry until close", async () => {
+		const { streamId, tempPath } = await openExportStream();
+		openedTempPaths.push(tempPath);
+
+		expect(isOwnedExportPath(tempPath)).toBe(true);
+		// Spoofed paths must not satisfy the registry check.
+		expect(isOwnedExportPath("/tmp/not-ours.mp4")).toBe(false);
+
+		// A successful close keeps ownership so callers can still move or discard
+		// the file via the subsequent IPC call.
+		const result = await closeExportStream(streamId);
+		expect(result.tempPath).toBe(tempPath);
+		expect(isOwnedExportPath(tempPath)).toBe(true);
 	});
 
 	it("rejects writes after the stream has been aborted", async () => {

@@ -5,7 +5,14 @@ import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import type { SaveDialogOptions } from "electron";
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
-import { closeExportStream, openExportStream, writeToExportStream } from "../export/exportStream";
+import {
+	closeExportStream,
+	isOwnedExportPath,
+	openExportStream,
+	registerOwnedExportPath,
+	releaseOwnedExportPath,
+	writeToExportStream,
+} from "../export/exportStream";
 import {
 	enqueueNativeVideoExportFrameWrite,
 	flushNativeVideoExportPendingWriteRequests,
@@ -302,6 +309,15 @@ export function registerExportHandlers() {
 					options ?? {},
 				);
 				nativeVideoExportSessions.delete(sessionId);
+				// Register the finalized path so only app-produced paths can flow back
+				// through finalize-exported-video / discard-exported-temp.
+				registerOwnedExportPath(finalizedPath);
+				if (finalizedPath !== session.outputPath) {
+					// muxNativeVideoExportAudio removes the intermediate on success,
+					// but clear our registry entry defensively in case a future refactor
+					// changes that contract.
+					releaseOwnedExportPath(session.outputPath);
+				}
 
 				// Return a temp path instead of reading the file back into memory so we
 				// never hit V8's per-ArrayBuffer limit on >2 GiB exports. The renderer
@@ -328,11 +344,29 @@ export function registerExportHandlers() {
 	ipcMain.handle(
 		"mux-exported-video-audio-from-path",
 		async (_, videoPath: string, options?: NativeVideoExportFinishOptions) => {
+			if (typeof videoPath !== "string" || !isOwnedExportPath(videoPath)) {
+				return {
+					success: false,
+					error: "Video path is not an app-managed export temp",
+				};
+			}
 			try {
 				const finalizedPath = await muxNativeVideoExportAudio(videoPath, options ?? {});
+				if (finalizedPath !== videoPath) {
+					registerOwnedExportPath(finalizedPath);
+					// muxNativeVideoExportAudio removes the intermediate on success, so
+					// the input is no longer owned by the registry after the call
+					// returns.
+					releaseOwnedExportPath(videoPath);
+				}
 				return { success: true, tempPath: finalizedPath };
 			} catch (error) {
-				await removeTemporaryExportFile(videoPath);
+				// Only clean up the input path if it is still an owned temp (i.e.
+				// muxNativeVideoExportAudio failed before consuming it).
+				if (isOwnedExportPath(videoPath)) {
+					await removeTemporaryExportFile(videoPath);
+					releaseOwnedExportPath(videoPath);
+				}
 				return { success: false, error: String(error) };
 			}
 		},
@@ -445,10 +479,10 @@ export function registerExportHandlers() {
 				return { success: false, error: "Invalid finalize-exported-video payload" };
 			}
 
-			if (!isTempPathSafe(tempPath)) {
+			if (!isTempPathSafe(tempPath) || !isOwnedExportPath(tempPath)) {
 				return {
 					success: false,
-					error: "Temp path is not inside the allowed temp directory",
+					error: "Temp path is not an app-managed export temp",
 				};
 			}
 
@@ -465,6 +499,7 @@ export function registerExportHandlers() {
 				if (payload.outputPath) {
 					const resolvedPath = path.resolve(payload.outputPath);
 					await moveExportedTempFile(tempPath, resolvedPath);
+					releaseOwnedExportPath(tempPath);
 					approveUserPath(resolvedPath);
 					return {
 						success: true,
@@ -501,6 +536,7 @@ export function registerExportHandlers() {
 				}
 
 				await moveExportedTempFile(tempPath, result.filePath);
+				releaseOwnedExportPath(tempPath);
 				approveUserPath(result.filePath);
 
 				return {
@@ -525,14 +561,15 @@ export function registerExportHandlers() {
 		if (typeof tempPath !== "string" || tempPath.length === 0) {
 			return { success: false, error: "Invalid temp path" };
 		}
-		if (!isTempPathSafe(tempPath)) {
+		if (!isTempPathSafe(tempPath) || !isOwnedExportPath(tempPath)) {
 			return {
 				success: false,
-				error: "Temp path is not inside the allowed temp directory",
+				error: "Temp path is not an app-managed export temp",
 			};
 		}
 		try {
 			await removeTemporaryExportFile(tempPath);
+			releaseOwnedExportPath(tempPath);
 			return { success: true };
 		} catch (error) {
 			return { success: false, error: String(error) };
