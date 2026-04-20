@@ -191,7 +191,7 @@ interface Window {
 			},
 		) => Promise<{
 			success: boolean;
-			data?: Uint8Array;
+			tempPath?: string;
 			encoderName?: string;
 			error?: string;
 		}>;
@@ -212,6 +212,52 @@ interface Window {
 			data?: Uint8Array;
 			error?: string;
 		}>;
+		muxExportedVideoAudioFromPath: (
+			videoPath: string,
+			options?: {
+				audioMode?: "none" | "copy-source" | "trim-source" | "edited-track";
+				audioSourcePath?: string | null;
+				trimSegments?: Array<{ startMs: number; endMs: number }>;
+				editedAudioData?: ArrayBuffer;
+				editedAudioMimeType?: string | null;
+			},
+		) => Promise<{
+			success: boolean;
+			tempPath?: string;
+			error?: string;
+		}>;
+		openExportStream: (options?: { extension?: string }) => Promise<{
+			success: boolean;
+			streamId?: string;
+			tempPath?: string;
+			error?: string;
+		}>;
+		writeExportStreamChunk: (
+			streamId: string,
+			position: number,
+			chunk: Uint8Array,
+		) => Promise<{ success: boolean; error?: string }>;
+		closeExportStream: (
+			streamId: string,
+			options?: { abort?: boolean },
+		) => Promise<{
+			success: boolean;
+			tempPath?: string;
+			bytesWritten?: number;
+			error?: string;
+		}>;
+		finalizeExportedVideo: (payload: {
+			tempPath: string;
+			fileName: string;
+			outputPath?: string | null;
+		}) => Promise<{
+			success: boolean;
+			path?: string;
+			canceled?: boolean;
+			message?: string;
+			error?: string;
+		}>;
+		discardExportedTemp: (tempPath: string) => Promise<{ success: boolean; error?: string }>;
 		getVideoAudioFallbackPaths: (
 			videoPath: string,
 		) => Promise<{ success: boolean; paths: string[]; error?: string }>;
@@ -330,9 +376,9 @@ interface Window {
 		getCurrentVideoPath: () => Promise<{ success: boolean; path?: string }>;
 		clearCurrentVideoPath: () => Promise<{ success: boolean }>;
 		deleteRecordingFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
-		getLocalMediaUrl: (filePath: string) => Promise<
-			{ success: true; url: string } | { success: false }
-		>;
+		getLocalMediaUrl: (
+			filePath: string,
+		) => Promise<{ success: true; url: string } | { success: false }>;
 		saveProjectFile: (
 			projectData: unknown,
 			suggestedName?: string,

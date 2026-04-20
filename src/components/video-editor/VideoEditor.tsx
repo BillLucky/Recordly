@@ -190,7 +190,12 @@ type EditorHistorySnapshot = {
 
 type PendingExportSave = {
 	fileName: string;
-	arrayBuffer: ArrayBuffer;
+	// Exactly one of these is populated. `tempFilePath` is the preferred form
+	// for MP4 exports — the main process holds the finished file on disk, so
+	// "Save Again" just renames it instead of round-tripping through the
+	// renderer's ArrayBuffer heap.
+	arrayBuffer?: ArrayBuffer;
+	tempFilePath?: string;
 };
 
 type CancelableExporter = {
@@ -555,6 +560,14 @@ export default function VideoEditor() {
 	const [resolvedWebcamVideoUrl, setResolvedWebcamVideoUrl] = useState<string | null>(null);
 	const [zoomRegions, setZoomRegions] = useState<ZoomRegion[]>([]);
 	const [cursorTelemetry, setCursorTelemetry] = useState<CursorTelemetryPoint[]>([]);
+	// Tracks the videoSourcePath for which the cursor telemetry IPC has already
+	// resolved. The smoke-export auto-trigger waits on this so long recordings
+	// still bake cursor/zoom animations into the output — without it, the
+	// auto-export fires as soon as the video loads and the telemetry arrives
+	// after encoding has started.
+	const [cursorTelemetrySourcePath, setCursorTelemetrySourcePath] = useState<
+		string | null
+	>(null);
 	const [selectedZoomId, setSelectedZoomId] = useState<string | null>(null);
 	const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
 	const [selectedTrimId, setSelectedTrimId] = useState<string | null>(null);
@@ -699,8 +712,14 @@ export default function VideoEditor() {
 	}, []);
 
 	const clearPendingExportSave = useCallback(() => {
+		const pending = pendingExportSaveRef.current;
 		pendingExportSaveRef.current = null;
 		setHasPendingExportSave(false);
+		if (pending?.tempFilePath && typeof window !== "undefined") {
+			// Best-effort cleanup — main-process also reaps stale temp files on
+			// before-quit, so we ignore failures here.
+			void window.electronAPI.discardExportedTemp?.(pending.tempFilePath);
+		}
 	}, []);
 
 	const refreshProjectLibrary = useCallback(async () => {
@@ -745,7 +764,9 @@ export default function VideoEditor() {
 		}
 		context.imageSmoothingEnabled = true;
 		context.imageSmoothingQuality = "high";
-		const editorBgHsl = getComputedStyle(document.documentElement).getPropertyValue("--editor-bg").trim();
+		const editorBgHsl = getComputedStyle(document.documentElement)
+			.getPropertyValue("--editor-bg")
+			.trim();
 		context.fillStyle = editorBgHsl ? `hsl(${editorBgHsl})` : "#111113";
 		context.fillRect(0, 0, targetWidth, targetHeight);
 
@@ -781,7 +802,9 @@ export default function VideoEditor() {
 					padding,
 					cropRegion,
 					webcam,
-					webcamUrl: resolvedWebcamVideoUrl ?? (webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
+					webcamUrl:
+						resolvedWebcamVideoUrl ??
+						(webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
 					videoWidth: previewVideo.videoWidth,
 					videoHeight: previewVideo.videoHeight,
 					annotationRegions,
@@ -934,7 +957,11 @@ export default function VideoEditor() {
 		return () => {
 			exporterRef.current?.cancel();
 			exporterRef.current = null;
+			const pending = pendingExportSaveRef.current;
 			pendingExportSaveRef.current = null;
+			if (pending?.tempFilePath && typeof window !== "undefined") {
+				void window.electronAPI.discardExportedTemp?.(pending.tempFilePath);
+			}
 			if (pendingTelemetryRetryTimeoutRef.current !== null) {
 				window.clearTimeout(pendingTelemetryRetryTimeoutRef.current);
 				pendingTelemetryRetryTimeoutRef.current = null;
@@ -2236,6 +2263,7 @@ export default function VideoEditor() {
 			if (!videoPath || !videoSourcePath) {
 				if (mounted) {
 					setCursorTelemetry([]);
+					setCursorTelemetrySourcePath(null);
 				}
 				return;
 			}
@@ -2245,6 +2273,7 @@ export default function VideoEditor() {
 				if (mounted) {
 					const samples = result.success ? result.samples : [];
 					setCursorTelemetry(samples);
+					setCursorTelemetrySourcePath(videoSourcePath);
 
 					const shouldRetryFreshRecordingTelemetry =
 						pendingFreshRecordingAutoZoomPathRef.current === videoPath &&
@@ -2265,6 +2294,7 @@ export default function VideoEditor() {
 				console.warn("Unable to load cursor telemetry:", telemetryError);
 				if (mounted) {
 					setCursorTelemetry([]);
+					setCursorTelemetrySourcePath(videoSourcePath);
 					if (
 						pendingFreshRecordingAutoZoomPathRef.current === videoPath &&
 						autoSuggestedVideoPathRef.current !== videoPath &&
@@ -3539,7 +3569,9 @@ export default function VideoEditor() {
 						videoPadding: padding,
 						cropRegion,
 						webcam,
-						webcamUrl: resolvedWebcamVideoUrl ?? (webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
+						webcamUrl:
+							resolvedWebcamVideoUrl ??
+							(webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
 						annotationRegions,
 						autoCaptions,
 						autoCaptionSettings,
@@ -3708,7 +3740,9 @@ export default function VideoEditor() {
 						padding,
 						cropRegion,
 						webcam,
-						webcamUrl: resolvedWebcamVideoUrl ?? (webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
+						webcamUrl:
+							resolvedWebcamVideoUrl ??
+							(webcam.sourcePath ? toFileUrl(webcam.sourcePath) : null),
 						annotationRegions,
 						autoCaptions,
 						autoCaptionSettings,
@@ -3750,19 +3784,51 @@ export default function VideoEditor() {
 							? Math.round(performance.now() - smokeExportStartedAt)
 							: undefined;
 
-					if (result.success && result.blob) {
-						const arrayBuffer = await result.blob.arrayBuffer();
+					if (result.success && (result.blob || result.tempFilePath)) {
 						const timestamp = Date.now();
 						const fileName = `export-${timestamp}.mp4`;
 						markExportAsSaving();
 
-						const saveResult =
-							smokeExportConfig.enabled && smokeExportConfig.outputPath
-								? await window.electronAPI.writeExportedVideoToPath(
-										arrayBuffer,
-										smokeExportConfig.outputPath,
-									)
-								: await window.electronAPI.saveExportedVideo(arrayBuffer, fileName);
+						let saveResult: {
+							success: boolean;
+							path?: string;
+							message?: string;
+							canceled?: boolean;
+						};
+						let pendingOnCancel: PendingExportSave;
+
+						if (result.tempFilePath) {
+							// Preferred path: main process already holds the finished MP4 on
+							// disk, so we just ask it to move the temp file into place. This
+							// avoids ever allocating a multi-GiB ArrayBuffer in the renderer.
+							saveResult = await window.electronAPI.finalizeExportedVideo({
+								tempPath: result.tempFilePath,
+								fileName,
+								outputPath:
+									smokeExportConfig.enabled && smokeExportConfig.outputPath
+										? smokeExportConfig.outputPath
+										: null,
+							});
+							pendingOnCancel = { fileName, tempFilePath: result.tempFilePath };
+						} else if (result.blob) {
+							// Legacy fallback: small exports may still surface a Blob (GIF,
+							// smoke tests in non-Electron environments, etc.).
+							const arrayBuffer = await result.blob.arrayBuffer();
+							saveResult =
+								smokeExportConfig.enabled && smokeExportConfig.outputPath
+									? await window.electronAPI.writeExportedVideoToPath(
+											arrayBuffer,
+											smokeExportConfig.outputPath,
+										)
+									: await window.electronAPI.saveExportedVideo(
+											arrayBuffer,
+											fileName,
+										);
+							pendingOnCancel = { fileName, arrayBuffer };
+						} else {
+							saveResult = { success: false, message: "Export produced no output" };
+							pendingOnCancel = { fileName };
+						}
 
 						if (saveResult.canceled) {
 							if (smokeExportConfig.enabled) {
@@ -3780,7 +3846,7 @@ export default function VideoEditor() {
 									metrics: result.metrics,
 								});
 							}
-							pendingExportSaveRef.current = { arrayBuffer, fileName };
+							pendingExportSaveRef.current = pendingOnCancel;
 							setHasPendingExportSave(true);
 							setExportError(
 								"Save dialog canceled. Click Save Again to save without re-rendering.",
@@ -3974,6 +4040,18 @@ export default function VideoEditor() {
 			return;
 		}
 
+		// When smoke-export opens a .recordly project, the cursor telemetry
+		// sidecar is loaded asynchronously after the editor state applies.
+		// Without this gate the auto-export fires before telemetry arrives and
+		// produces a video with no cursor/zoom animations.
+		if (
+			smokeExportConfig.projectPath &&
+			videoSourcePath &&
+			cursorTelemetrySourcePath !== videoSourcePath
+		) {
+			return;
+		}
+
 		smokeExportStartedRef.current = true;
 		void handleExport({
 			format: "mp4",
@@ -3981,12 +4059,15 @@ export default function VideoEditor() {
 			encodingMode: smokeExportConfig.encodingMode ?? "balanced",
 		});
 	}, [
+		cursorTelemetrySourcePath,
 		error,
 		handleExport,
 		loading,
 		smokeExportConfig.enabled,
 		smokeExportConfig.encodingMode,
+		smokeExportConfig.projectPath,
 		videoPath,
+		videoSourcePath,
 	]);
 
 	const handleOpenExportDropdown = useCallback(() => {
@@ -4089,10 +4170,27 @@ export default function VideoEditor() {
 			return;
 		}
 
-		const saveResult = await window.electronAPI.saveExportedVideo(
-			pendingSave.arrayBuffer,
-			pendingSave.fileName,
-		);
+		let saveResult: {
+			success: boolean;
+			path?: string;
+			message?: string;
+			canceled?: boolean;
+		};
+
+		if (pendingSave.tempFilePath) {
+			saveResult = await window.electronAPI.finalizeExportedVideo({
+				tempPath: pendingSave.tempFilePath,
+				fileName: pendingSave.fileName,
+				outputPath: null,
+			});
+		} else if (pendingSave.arrayBuffer) {
+			saveResult = await window.electronAPI.saveExportedVideo(
+				pendingSave.arrayBuffer,
+				pendingSave.fileName,
+			);
+		} else {
+			saveResult = { success: false, message: "No pending export to save" };
+		}
 
 		if (saveResult.canceled) {
 			setExportError("Save dialog canceled. Click Save Again to save without re-rendering.");
@@ -4101,7 +4199,11 @@ export default function VideoEditor() {
 		}
 
 		if (saveResult.success && saveResult.path) {
-			clearPendingExportSave();
+			// finalizeExportedVideo already moved the temp file into place, so the
+			// pending-save entry no longer refers to a file on disk. Flip the flag
+			// directly to avoid clearPendingExportSave issuing a spurious discard.
+			pendingExportSaveRef.current = null;
+			setHasPendingExportSave(false);
 			setExportError(null);
 			setExportedFilePath(saveResult.path);
 			showExportSuccessToast(saveResult.path);
@@ -4112,7 +4214,7 @@ export default function VideoEditor() {
 		const errorMessage = saveResult.message || "Failed to save video";
 		setExportError(errorMessage);
 		toast.error(errorMessage);
-	}, [clearPendingExportSave, showExportSuccessToast]);
+	}, [showExportSuccessToast]);
 
 	const handleOpenCropEditor = useCallback(() => {
 		cropSnapshotRef.current = { ...cropRegion };
@@ -4454,7 +4556,10 @@ export default function VideoEditor() {
 									</p>
 									{isRenderingAudio ? (
 										<p className="mt-1 text-[11px] text-muted-foreground/70">
-											{t("editor.export.processingAudioEdits", "Processing audio with speed/overlay edits")}
+											{t(
+												"editor.export.processingAudioEdits",
+												"Processing audio with speed/overlay edits",
+											)}
 										</p>
 									) : exportRenderSpeedLabel ? (
 										<p className="mt-1 text-[11px] text-muted-foreground/70">
